@@ -8,31 +8,62 @@ import logging
 import chelper
 from mcu import MCU_trsync, TRSYNC_TIMEOUT, TRSYNC_SINGLE_MCU_TIMEOUT
 
-from . import probe
+from adxl345 import ADXL345
+from bulk_sensor import BulkDataQueue
+from probe import PrinterProbe
+
+
+class Adxl345ProbeBulkDataQueue(BulkDataQueue):
+    def __init__(self, mcu, oid, endstop):
+        super().__init__(mcu, oid)
+        # by default, we are not homing
+        self.homing = False
+        self.endstop = endstop
+
+    def _handle_data(self, params):
+        if self.homing:
+            # this triggers it
+            # self.endstop.trigger(0)
+            pass
+        else:
+            with self.lock:
+                self.raw_samples.append(params)
+
+
+class CustomADXL345(ADXL345):
+    def __init__(self, config,probe):
+        super().__init__(config)
+        # replace bulk_queue with our own
+        self.bulk_queue = Adxl345ProbeBulkDataQueue(self.mcu, self.oid, probe.probe_endstop)
+
+    def start(self):
+        # just call super _start_measurements() to setup ADXL, we will read directly in our Adxl345ProbeBulkDataQueue.
+        super()._start_measurements()
+
+    def stop(self):
+        super()._finish_measurements()
 
 
 class ADXL345Probe_endstop:
-    def __init__(self, accel_chip):
-        self._accel_chip = accel_chip
-        self._mcu = accel_chip.mcu
-        self._reactor = self._mcu.get_printer().get_reactor()
-        self._oid = self._mcu.create_oid()
-        self._mcu.register_config_callback(self._build_config)
+    def __init__(self, adxl345):
+        self.adxl345 = adxl345
+        self.mcu = adxl345.mcu
+        self._reactor = self.mcu.get_printer().get_reactor()
+        self._oid = self.mcu.create_oid()
+        self.mcu.register_config_callback(self._build_config)
         self._trigger_completion = None
         self._rest_ticks = 0
         ffi_main, ffi_lib = chelper.get_ffi()
         self._trdispatch = ffi_main.gc(ffi_lib.trdispatch_alloc(), ffi_lib.free)
-        self._trsyncs = [MCU_trsync(self._mcu, self._trdispatch)]
+        self._trsyncs = [MCU_trsync(self.mcu, self._trdispatch)]
 
-        self.hammer_timer = None
         self._triggered = False
 
-
     def get_mcu(self):
-        return self._mcu
+        return self.mcu
 
     def add_stepper(self, stepper):
-        logging.info("aadxlprobe - dd_stepper")
+        logging.info("adxlprobe - add_stepper")
         trsyncs = {trsync.get_mcu(): trsync for trsync in self._trsyncs}
         trsync = trsyncs.get(stepper.get_mcu())
         if trsync is None:
@@ -45,7 +76,7 @@ class ADXL345Probe_endstop:
             for ot in self._trsyncs:
                 for s in ot.get_steppers():
                     if ot is not trsync and s.get_name().startswith(sname[:9]):
-                        cerror = self._mcu.get_printer().config_error
+                        cerror = self.mcu.get_printer().config_error
                         raise cerror("Multi-mcu homing not supported on"
                                      " multi-mcu shared axis")
 
@@ -60,8 +91,8 @@ class ADXL345Probe_endstop:
         logging.info(f"adxlprobe - home_start print_time: {print_time} sample_time: {sample_time} sample_count: {sample_count} rest_time: {rest_time} triggered: {triggered}")
         logging.info(f"adxlprobe - home_start time: {self._reactor.monotonic()}")
 
-        clock = self._mcu.print_time_to_clock(print_time)
-        rest_ticks = self._mcu.print_time_to_clock(print_time + rest_time) - clock
+        clock = self.mcu.print_time_to_clock(print_time)
+        rest_ticks = self.mcu.print_time_to_clock(print_time + rest_time) - clock
         self._rest_ticks = rest_ticks
         self._trigger_completion = self._reactor.completion()
         expire_timeout = TRSYNC_TIMEOUT
@@ -75,23 +106,22 @@ class ADXL345Probe_endstop:
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_start(self._trdispatch, etrsync.REASON_HOST_REQUEST)
 
-        self.hammer_timer = self._reactor.register_timer(self._hammer_trigger, self._reactor.monotonic() + 10.0)  # stop in 10 seconds
-        return self._trigger_completion
+        # start our ADXL
+        self.adxl345.start()
 
-    def _hammer_trigger(self, eventtime):
-        logging.info(f"adxlprobe - _hammer_trigger eventtime: {eventtime}")
-        logging.info(f"adxlprobe - _hammer_trigger time: {self._reactor.monotonic()}")
-        self._triggered = True
-        self._trigger_completion.complete(True)
-        return self._reactor.NEVER
+        self._reactor.register_timer(self.trigger, self._reactor.monotonic() + 5.0)
+
+        return self._trigger_completion
 
     def home_wait(self, home_end_time):
         logging.info(f"adxlprobe - home_wait home_end_time: {home_end_time}")
         logging.info(f"adxlprobe - home_wait time: {self._reactor.monotonic()}")
 
+        self.adxl345.stop()
+
         etrsync = self._trsyncs[0]
         etrsync.set_home_end_time(home_end_time)
-        if self._mcu.is_fileoutput():
+        if self.mcu.is_fileoutput():
             self._trigger_completion.complete(True)
         logging.info(f"adxlprobe - will wait")
         self._trigger_completion.wait()
@@ -111,7 +141,7 @@ class ADXL345Probe_endstop:
 
         if res[0] != etrsync.REASON_ENDSTOP_HIT:
             return 0.
-        if self._mcu.is_fileoutput():
+        if self.mcu.is_fileoutput():
             return home_end_time
         return home_end_time
 
@@ -119,6 +149,13 @@ class ADXL345Probe_endstop:
         logging.info(f"adxlprobe - query_endstop print_time: {print_time}")
         return 0
         # todo improve this? how?
+
+    def trigger(self, eventtime):
+        logging.info(f"adxlprobe - _hammer_trigger eventtime: {eventtime}")
+        logging.info(f"adxlprobe - _hammer_trigger time: {self._reactor.monotonic()}")
+        self._triggered = True
+        self._trigger_completion.complete(True)
+        return self._reactor.NEVER
 
 
 # ADXL345 "endstop" wrapper
@@ -135,19 +172,15 @@ class ADXL345Probe:
         self.deactivate_gcode = gcode_macro.load_template(
             config, 'deactivate_gcode', '')
 
-        self.accel_chip_name = config.get("accel_chip").strip()
-
         self.printer.register_event_handler('klippy:mcu_identify',
                                             self._handle_mcu_identify)
-        # self.printer.register_event_handler("klippy:connect", self._handle_connect)
         # multi probes state
         self.multi = 'OFF'
 
-        # def _handle_connect(self):
-        self.accel_chip = self.printer.load_object(config, self.accel_chip_name)
-
+        self.adxl345 = CustomADXL345(config,self)
+        self.printer.add_object('adxl345', self.adxl345)
         # Create our own virtual endstop
-        self.probe_endstop = ADXL345Probe_endstop(self.accel_chip)
+        self.probe_endstop = ADXL345Probe_endstop(self.adxl345)
 
         # wrappers
         self.get_mcu = self.probe_endstop.get_mcu
@@ -214,5 +247,5 @@ class ADXL345Probe:
 
 def load_config(config):
     adxl_probe = ADXL345Probe(config)
-    config.get_printer().add_object('probe', probe.PrinterProbe(config, adxl_probe))
+    config.get_printer().add_object('probe', PrinterProbe(config, adxl_probe))
     return adxl_probe
